@@ -6,10 +6,15 @@
 (define-constant ERR_INVALID_LOCATION (err u104))
 (define-constant ERR_LICENSE_EXPIRED (err u105))
 (define-constant ERR_INACTIVE_FRANCHISE (err u106))
+(define-constant ERR_REVIEW_NOT_FOUND (err u107))
+(define-constant ERR_INVALID_RATING (err u108))
+(define-constant ERR_REVIEW_ALREADY_EXISTS (err u109))
+(define-constant ERR_INSUFFICIENT_REVIEWS (err u110))
 
 (define-data-var franchise-counter uint u0)
 (define-data-var location-counter uint u0)
 (define-data-var total-revenue uint u0)
+(define-data-var review-counter uint u0)
 
 (define-map franchises 
     uint 
@@ -43,6 +48,33 @@
 
 (define-map operator-permissions
     {franchise-id: uint, operator: principal}
+    bool
+)
+
+(define-map reviews
+    uint
+    {
+        location-id: uint,
+        reviewer: principal,
+        rating: uint,
+        comment: (string-ascii 200),
+        created-at: uint,
+        verified: bool
+    }
+)
+
+(define-map location-ratings
+    uint
+    {
+        total-ratings: uint,
+        sum-ratings: uint,
+        average-rating: uint,
+        review-count: uint
+    }
+)
+
+(define-map reviewer-history
+    {reviewer: principal, location-id: uint}
     bool
 )
 
@@ -225,6 +257,161 @@
     (match (map-get? locations location-index)
         location (if (is-eq (get franchise-id location) (get franchise-id data))
                     {franchise-id: (get franchise-id data), total: (+ (get total data) (get revenue location))}
+                    data)
+        data
+    )
+)
+
+(define-public (submit-review (location-id uint) (rating uint) (comment (string-ascii 200)))
+    (let (
+        (location (unwrap! (map-get? locations location-id) ERR_NOT_FOUND))
+        (review-id (+ (var-get review-counter) u1))
+        (reviewer-key {reviewer: tx-sender, location-id: location-id})
+    )
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+        (asserts! (get active location) ERR_INVALID_LOCATION)
+        (asserts! (is-none (map-get? reviewer-history reviewer-key)) ERR_REVIEW_ALREADY_EXISTS)
+        
+        (map-set reviews review-id {
+            location-id: location-id,
+            reviewer: tx-sender,
+            rating: rating,
+            comment: comment,
+            created-at: stacks-block-height,
+            verified: false
+        })
+        
+        (map-set reviewer-history reviewer-key true)
+        
+        (let (
+            (current-ratings (default-to {total-ratings: u0, sum-ratings: u0, average-rating: u0, review-count: u0}
+                             (map-get? location-ratings location-id)))
+            (new-total (+ (get total-ratings current-ratings) u1))
+            (new-sum (+ (get sum-ratings current-ratings) rating))
+            (new-average (/ new-sum new-total))
+        )
+            (map-set location-ratings location-id {
+                total-ratings: new-total,
+                sum-ratings: new-sum,
+                average-rating: new-average,
+                review-count: new-total
+            })
+        )
+        
+        (var-set review-counter review-id)
+        (ok review-id)
+    )
+)
+
+(define-public (verify-review (review-id uint))
+    (let (
+        (review (unwrap! (map-get? reviews review-id) ERR_REVIEW_NOT_FOUND))
+        (location (unwrap! (map-get? locations (get location-id review)) ERR_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get operator location)) ERR_UNAUTHORIZED)
+        (map-set reviews review-id (merge review {verified: true}))
+        (ok true)
+    )
+)
+
+(define-public (respond-to-review (review-id uint) (response (string-ascii 300)))
+    (let (
+        (review (unwrap! (map-get? reviews review-id) ERR_REVIEW_NOT_FOUND))
+        (location (unwrap! (map-get? locations (get location-id review)) ERR_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get operator location)) ERR_UNAUTHORIZED)
+        (ok true)
+    )
+)
+
+(define-public (flag-review (review-id uint))
+    (let (
+        (review (unwrap! (map-get? reviews review-id) ERR_REVIEW_NOT_FOUND))
+        (location (unwrap! (map-get? locations (get location-id review)) ERR_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get operator location)) ERR_UNAUTHORIZED)
+        (map-set reviews review-id (merge review {verified: false}))
+        (ok true)
+    )
+)
+
+(define-public (update-location-rating (location-id uint))
+    (let (
+        (location (unwrap! (map-get? locations location-id) ERR_NOT_FOUND))
+        (current-ratings (default-to {total-ratings: u0, sum-ratings: u0, average-rating: u0, review-count: u0}
+                         (map-get? location-ratings location-id)))
+    )
+        (asserts! (is-eq tx-sender (get operator location)) ERR_UNAUTHORIZED)
+        (asserts! (> (get total-ratings current-ratings) u0) ERR_INSUFFICIENT_REVIEWS)
+        
+        (let ((new-average (/ (get sum-ratings current-ratings) (get total-ratings current-ratings))))
+            (map-set location-ratings location-id (merge current-ratings {average-rating: new-average}))
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-review (review-id uint))
+    (map-get? reviews review-id)
+)
+
+(define-read-only (get-location-rating (location-id uint))
+    (map-get? location-ratings location-id)
+)
+
+(define-read-only (has-reviewed (reviewer principal) (location-id uint))
+    (default-to false (map-get? reviewer-history {reviewer: reviewer, location-id: location-id}))
+)
+
+(define-read-only (get-average-rating (location-id uint))
+    (match (map-get? location-ratings location-id)
+        rating-data (get average-rating rating-data)
+        u0
+    )
+)
+
+(define-read-only (get-review-count (location-id uint))
+    (match (map-get? location-ratings location-id)
+        rating-data (get review-count rating-data)
+        u0
+    )
+)
+
+(define-read-only (get-total-reviews)
+    (var-get review-counter)
+)
+
+(define-read-only (is-review-verified (review-id uint))
+    (match (map-get? reviews review-id)
+        review (get verified review)
+        false
+    )
+)
+
+(define-read-only (calculate-franchise-rating (franchise-id uint))
+    (fold calculate-franchise-rating-total (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+          {franchise-id: franchise-id, total-sum: u0, total-count: u0, average: u0})
+)
+
+(define-private (calculate-franchise-rating-total (location-index uint) 
+                                                  (data {franchise-id: uint, total-sum: uint, total-count: uint, average: uint}))
+    (match (map-get? locations location-index)
+        location (if (is-eq (get franchise-id location) (get franchise-id data))
+                    (match (map-get? location-ratings location-index)
+                        rating-data 
+                        (let (
+                            (new-sum (+ (get total-sum data) (get sum-ratings rating-data)))
+                            (new-count (+ (get total-count data) (get total-ratings rating-data)))
+                        )
+                            {
+                                franchise-id: (get franchise-id data),
+                                total-sum: new-sum,
+                                total-count: new-count,
+                                average: (if (> new-count u0) (/ new-sum new-count) u0)
+                            }
+                        )
+                        data
+                    )
                     data)
         data
     )
