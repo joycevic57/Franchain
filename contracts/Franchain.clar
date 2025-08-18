@@ -10,11 +10,17 @@
 (define-constant ERR_INVALID_RATING (err u108))
 (define-constant ERR_REVIEW_ALREADY_EXISTS (err u109))
 (define-constant ERR_INSUFFICIENT_REVIEWS (err u110))
+(define-constant ERR_TERRITORY_NOT_FOUND (err u111))
+(define-constant ERR_TERRITORY_CONFLICT (err u112))
+(define-constant ERR_INVALID_COORDINATES (err u113))
+(define-constant ERR_TERRITORY_ALREADY_ASSIGNED (err u114))
+(define-constant ERR_TERRITORY_NOT_AVAILABLE (err u115))
 
 (define-data-var franchise-counter uint u0)
 (define-data-var location-counter uint u0)
 (define-data-var total-revenue uint u0)
 (define-data-var review-counter uint u0)
+(define-data-var territory-counter uint u0)
 
 (define-map franchises 
     uint 
@@ -75,6 +81,33 @@
 
 (define-map reviewer-history
     {reviewer: principal, location-id: uint}
+    bool
+)
+
+(define-map territories
+    uint
+    {
+        franchise-id: uint,
+        name: (string-ascii 100),
+        north-lat: uint,
+        south-lat: uint,
+        east-lng: uint,
+        west-lng: uint,
+        population: uint,
+        market-value: uint,
+        assigned-operator: (optional principal),
+        active: bool,
+        created-at: uint
+    }
+)
+
+(define-map territory-assignments
+    {franchise-id: uint, operator: principal}
+    {territory-ids: (list 10 uint), territory-count: uint}
+)
+
+(define-map territory-conflicts
+    {territory-id: uint, conflicting-territory-id: uint}
     bool
 )
 
@@ -416,3 +449,192 @@
         data
     )
 )
+
+(define-public (create-territory (franchise-id uint) (name (string-ascii 100)) 
+                                (north-lat uint) (south-lat uint) (east-lng uint) (west-lng uint)
+                                (population uint) (market-value uint))
+    (let (
+        (franchise (unwrap! (map-get? franchises franchise-id) ERR_NOT_FOUND))
+        (territory-id (+ (var-get territory-counter) u1))
+    )
+        (asserts! (is-eq tx-sender (get owner franchise)) ERR_UNAUTHORIZED)
+        (asserts! (get active franchise) ERR_INACTIVE_FRANCHISE)
+        (asserts! (and (> north-lat south-lat) (> east-lng west-lng)) ERR_INVALID_COORDINATES)
+        (asserts! (is-none (get overlap-found (check-territory-overlap franchise-id north-lat south-lat east-lng west-lng))) ERR_TERRITORY_CONFLICT)
+        
+        (map-set territories territory-id {
+            franchise-id: franchise-id,
+            name: name,
+            north-lat: north-lat,
+            south-lat: south-lat,
+            east-lng: east-lng,
+            west-lng: west-lng,
+            population: population,
+            market-value: market-value,
+            assigned-operator: none,
+            active: true,
+            created-at: stacks-block-height
+        })
+        
+        (var-set territory-counter territory-id)
+        (ok territory-id)
+    )
+)
+
+(define-public (assign-territory (territory-id uint) (operator principal))
+    (let (
+        (territory (unwrap! (map-get? territories territory-id) ERR_TERRITORY_NOT_FOUND))
+        (franchise (unwrap! (map-get? franchises (get franchise-id territory)) ERR_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get owner franchise)) ERR_UNAUTHORIZED)
+        (asserts! (get active territory) ERR_TERRITORY_NOT_AVAILABLE)
+        (asserts! (is-none (get assigned-operator territory)) ERR_TERRITORY_ALREADY_ASSIGNED)
+        
+        (map-set territories territory-id (merge territory {assigned-operator: (some operator)}))
+        
+        (let (
+            (assignment-key {franchise-id: (get franchise-id territory), operator: operator})
+            (current-assignments (default-to {territory-ids: (list), territory-count: u0}
+                                 (map-get? territory-assignments assignment-key)))
+        )
+            (map-set territory-assignments assignment-key {
+                territory-ids: (unwrap! (as-max-len? 
+                                        (append (get territory-ids current-assignments) territory-id) u10) ERR_TERRITORY_CONFLICT),
+                territory-count: (+ (get territory-count current-assignments) u1)
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (transfer-territory (territory-id uint) (new-operator principal))
+    (let (
+        (territory (unwrap! (map-get? territories territory-id) ERR_TERRITORY_NOT_FOUND))
+        (franchise (unwrap! (map-get? franchises (get franchise-id territory)) ERR_NOT_FOUND))
+        (current-operator (unwrap! (get assigned-operator territory) ERR_TERRITORY_NOT_AVAILABLE))
+    )
+        (asserts! (is-eq tx-sender (get owner franchise)) ERR_UNAUTHORIZED)
+        (asserts! (get active territory) ERR_TERRITORY_NOT_AVAILABLE)
+        
+        (map-set territories territory-id (merge territory {assigned-operator: (some new-operator)}))
+        
+        (let (
+            (old-assignment-key {franchise-id: (get franchise-id territory), operator: current-operator})
+            (new-assignment-key {franchise-id: (get franchise-id territory), operator: new-operator})
+            (old-assignments (unwrap! (map-get? territory-assignments old-assignment-key) ERR_NOT_FOUND))
+            (new-assignments (default-to {territory-ids: (list), territory-count: u0}
+                             (map-get? territory-assignments new-assignment-key)))
+        )
+            (map-set territory-assignments old-assignment-key {
+                territory-ids: (filter remove-territory-id (get territory-ids old-assignments)),
+                territory-count: (- (get territory-count old-assignments) u1)
+            })
+            
+            (map-set territory-assignments new-assignment-key {
+                territory-ids: (unwrap! (as-max-len? 
+                                        (append (get territory-ids new-assignments) territory-id) u10) ERR_TERRITORY_CONFLICT),
+                territory-count: (+ (get territory-count new-assignments) u1)
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (deactivate-territory (territory-id uint))
+    (let (
+        (territory (unwrap! (map-get? territories territory-id) ERR_TERRITORY_NOT_FOUND))
+        (franchise (unwrap! (map-get? franchises (get franchise-id territory)) ERR_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get owner franchise)) ERR_UNAUTHORIZED)
+        (map-set territories territory-id (merge territory {active: false, assigned-operator: none}))
+        (ok true)
+    )
+)
+
+(define-public (update-territory-data (territory-id uint) (population uint) (market-value uint))
+    (let (
+        (territory (unwrap! (map-get? territories territory-id) ERR_TERRITORY_NOT_FOUND))
+        (franchise (unwrap! (map-get? franchises (get franchise-id territory)) ERR_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get owner franchise)) ERR_UNAUTHORIZED)
+        (map-set territories territory-id (merge territory {
+            population: population,
+            market-value: market-value
+        }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-territory (territory-id uint))
+    (map-get? territories territory-id)
+)
+
+(define-read-only (get-territory-assignments (franchise-id uint) (operator principal))
+    (map-get? territory-assignments {franchise-id: franchise-id, operator: operator})
+)
+
+(define-read-only (is-territory-available (territory-id uint))
+    (match (map-get? territories territory-id)
+        territory (and (get active territory) (is-none (get assigned-operator territory)))
+        false
+    )
+)
+
+(define-read-only (get-territory-count)
+    (var-get territory-counter)
+)
+
+(define-read-only (calculate-franchise-territory-value (franchise-id uint))
+    (fold calculate-territory-value-total (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+          {franchise-id: franchise-id, total-value: u0, total-population: u0})
+)
+
+(define-read-only (check-territory-overlap (franchise-id uint) (north-lat uint) (south-lat uint) (east-lng uint) (west-lng uint))
+    (fold check-overlap-with-territory (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+          {franchise-id: franchise-id, north-lat: north-lat, south-lat: south-lat, 
+           east-lng: east-lng, west-lng: west-lng, overlap-found: none})
+)
+
+(define-private (remove-territory-id (territory-id uint))
+    false
+)
+
+(define-private (calculate-territory-value-total (territory-index uint) 
+                                                (data {franchise-id: uint, total-value: uint, total-population: uint}))
+    (match (map-get? territories territory-index)
+        territory (if (is-eq (get franchise-id territory) (get franchise-id data))
+                     {
+                         franchise-id: (get franchise-id data),
+                         total-value: (+ (get total-value data) (get market-value territory)),
+                         total-population: (+ (get total-population data) (get population territory))
+                     }
+                     data)
+        data
+    )
+)
+
+(define-private (check-overlap-with-territory (territory-index uint)
+                                             (params {franchise-id: uint, north-lat: uint, south-lat: uint,
+                                                     east-lng: uint, west-lng: uint, overlap-found: (optional uint)}))
+    (match (map-get? territories territory-index)
+        territory (if (and (is-eq (get franchise-id territory) (get franchise-id params))
+                          (get active territory)
+                          (is-none (get overlap-found params)))
+                     (if (territories-overlap 
+                            (get north-lat params) (get south-lat params) (get east-lng params) (get west-lng params)
+                            (get north-lat territory) (get south-lat territory) (get east-lng territory) (get west-lng territory))
+                         (merge params {overlap-found: (some territory-index)})
+                         params)
+                     params)
+        params
+    )
+)
+
+(define-private (territories-overlap (n1 uint) (s1 uint) (e1 uint) (w1 uint) (n2 uint) (s2 uint) (e2 uint) (w2 uint))
+    (and (not (> s1 n2)) (not (> s2 n1)) (not (> w1 e2)) (not (> w2 e1)))
+)
+
+
+
