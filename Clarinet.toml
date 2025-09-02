@@ -9,6 +9,16 @@ requirements = []
 path = 'contracts/Franchain.clar'
 clarity_version = 3
 epoch = 3.1
+
+[contracts.franchise-analytics]
+path = 'contracts/franchise-analytics.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.franchise-marketing-hub]
+path = 'contracts/franchise-marketing-hub.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
